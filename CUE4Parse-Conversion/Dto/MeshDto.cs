@@ -452,9 +452,12 @@ public sealed class SkeletalMeshDto : SkeletonDto
 
     private void ParseMeshRenderData(USkinnedAsset mesh, EMeshQuality quality)
     {
+        // LODModels can be longer than LODInfo (S.T.A.L.K.E.R. 2 appends its fallback LOD models): those take the last LOD's screen size
+        var lodInfo = mesh.LODInfo!;
         foreach (var sourceLodIndex in quality.GetRange(mesh.LODModels!.Length, i => mesh.LODModels[i].SkipLod))
         {
-            LODs.Add(MeshLodDto<SkinnedMeshVertex>.FromSkeletalMesh(this, sourceLodIndex, mesh.LODModels[sourceLodIndex], mesh.LODInfo![sourceLodIndex].ScreenSize.Value));
+            var screenSize = lodInfo.Length > 0 ? lodInfo[Math.Min(sourceLodIndex, (uint) lodInfo.Length - 1)].ScreenSize.Value : 0f;
+            LODs.Add(MeshLodDto<SkinnedMeshVertex>.FromSkeletalMesh(this, sourceLodIndex, mesh.LODModels[sourceLodIndex], screenSize));
         }
     }
 

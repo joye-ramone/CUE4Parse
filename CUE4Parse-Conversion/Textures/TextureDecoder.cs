@@ -13,6 +13,7 @@ using CUE4Parse_Conversion.Textures.Custom;
 using CUE4Parse.Compression;
 using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse.UE4.Exceptions;
+using CUE4Parse.UE4.Objects.Core.Math;
 using CUE4Parse.UE4.Versions;
 using CUE4Parse.Utils;
 
@@ -114,13 +115,12 @@ public static class TextureDecoder
                 var layerData = ArrayPool<byte>.Shared.Rent(packedOutputSize);
                 var crunchContextCache = new Dictionary<(int ChunkIndex, uint Layer), CrunchDecoder.CrunchContext>();
 
-                for (uint tileIndexInMip = 0; tileIndexInMip < tileOffsetData.MaxAddress; tileIndexInMip++)
+                // decodes the tile at (lvl, address) of this layer with its borders; false when a crunch tile fails
+                bool ReadTile(int lvl, uint address, out byte[] data, out EPixelFormat tileColorType)
                 {
-                    if (!vt.IsValidAddress(level, tileIndexInMip)) continue;
-
-                    var tileX = (int)MathUtils.ReverseMortonCode2(tileIndexInMip) * tileSize;
-                    var tileY = (int)MathUtils.ReverseMortonCode2(tileIndexInMip >> 1) * tileSize;
-                    var (chunkIndex, tileStart, tileLength) = vt.GetTileData(level, tileIndexInMip, layer);
+                    data = [];
+                    tileColorType = EPixelFormat.PF_Unknown;
+                    var (chunkIndex, tileStart, tileLength) = vt.GetTileData(lvl, address, layer);
 
                     if (vt.Chunks[chunkIndex].CodecType[layer] == EVirtualTextureCodec.ZippedGPU_DEPRECATED)
                         Compression.Decompress(vt.Chunks[chunkIndex].BulkData.Data!, (int)tileStart, (int)tileLength, layerData, 0, packedOutputSize, CompressionMethod.Zlib);
@@ -152,18 +152,40 @@ public static class TextureDecoder
 
                             var rowPitch = (uint) (tilePixelSize / formatInfo.BlockSizeX * formatInfo.BlockBytes);
                             if (!context.TryDecompressSegment(chunkData, checked((int) tileStart), tileLength, layerData, rowPitch, 0))
-                                throw new ParserException($"Failed to unpack tile ({tileX}, {tileY}) at {tileStart}");
+                                throw new ParserException($"Failed to unpack tile {address} of level {lvl} at {tileStart}");
                         }
                         catch (ParserException e)
                         {
                             Log.Error(e, "Failed to decompress crunch codec texture");
-                            break;
+                            return false;
                         }
                     }
                     else
                         Array.Copy(vt.Chunks[chunkIndex].BulkData.Data!, tileStart, layerData, 0, packedOutputSize);
 
-                    DecodeBytes(layerData, tilePixelSize, tilePixelSize, 1, formatInfo, texture.IsNormalMap, out var data, out var tileColorType);
+                    DecodeBytes(layerData, tilePixelSize, tilePixelSize, 1, formatInfo, texture.IsNormalMap, out data, out tileColorType);
+                    return true;
+                }
+
+                // UDIM blocks smaller than the largest one have no tiles in the finer levels: filled after this pass from a coarser level
+                var missing = new List<uint>();
+                var failed = false;
+                for (uint tileIndexInMip = 0; tileIndexInMip < tileOffsetData.MaxAddress; tileIndexInMip++)
+                {
+                    if (!vt.IsValidAddress(level, tileIndexInMip)) continue;
+                    if (!vt.HasTileData(level, tileIndexInMip))
+                    {
+                        missing.Add(tileIndexInMip);
+                        continue;
+                    }
+
+                    var tileX = (int)MathUtils.ReverseMortonCode2(tileIndexInMip) * tileSize;
+                    var tileY = (int)MathUtils.ReverseMortonCode2(tileIndexInMip >> 1) * tileSize;
+                    if (!ReadTile(level, tileIndexInMip, out var data, out var tileColorType))
+                    {
+                        failed = true;
+                        break;
+                    }
 
                     if (pixelDataPtr is null)
                     {
@@ -189,6 +211,95 @@ public static class TextureDecoder
                         srcSpan.CopyTo(destSpan);
                     }
                 }
+
+                // tiles without data here: the parent tile of the first coarser level that has one, upscaled (bilinear for 8-bit channels,
+                // the tile border gives the samples past the region's edge), as the VT sampler falls back at run time; none: the layer's
+                // fallback colour
+                var filled = 0;
+                foreach (var address in failed ? new List<uint>() : missing)
+                {
+                    var tx = MathUtils.ReverseMortonCode2(address);
+                    var ty = MathUtils.ReverseMortonCode2(address >> 1);
+                    var found = false;
+                    for (var coarse = level + 1; coarse < vt.NumMips && !found; coarse++)
+                    {
+                        var shift = coarse - level;
+                        var parent = MathUtils.MortonCode2(tx >> shift) | (MathUtils.MortonCode2(ty >> shift) << 1);
+                        if (!vt.IsValidAddress(coarse, parent) || !vt.HasTileData(coarse, parent)) continue;
+                        if (!ReadTile(coarse, parent, out var data, out var tileColorType)) break;
+
+                        if (pixelDataPtr is null)
+                        {
+                            colorType = tileColorType;
+                            if (!PixelFormatUtils.PixelFormats.TryGetValue(tileColorType, out var tempFormatInfo))
+                                throw new NotImplementedException("Unsupported pixel format: " + tileColorType);
+                            bytesPerPixel = tempFormatInfo.BlockBytes / (tempFormatInfo.BlockSizeX * tempFormatInfo.BlockSizeY * tempFormatInfo.BlockSizeZ);
+                            rowBytes = bytesPerPixel * bitmapWidth;
+                            tileRowBytes = tileSize * bytesPerPixel;
+                            var imageBytes = bitmapHeight * bitmapWidth * bytesPerPixel;
+                            pixelDataPtr = NativeMemory.Alloc((nuint)imageBytes);
+                            result = new Span<byte>(pixelDataPtr, imageBytes);
+                        }
+                        else if (colorType != tileColorType)
+                            throw new NotSupportedException("multiple pixelformats/colortypes in a single virtual image is not supported");
+
+                        var scale = 1 << shift;
+                        var originX = (tx & (uint) (scale - 1)) * tileSize / (float) scale + tileBorderSize;
+                        var originY = (ty & (uint) (scale - 1)) * tileSize / (float) scale + tileBorderSize;
+                        var bilinear = colorType is EPixelFormat.PF_B8G8R8A8 or EPixelFormat.PF_R8G8B8A8 or EPixelFormat.PF_G8 or EPixelFormat.PF_R8G8;
+                        for (var i = 0; i < tileSize; i++)
+                        {
+                            var sy = Math.Clamp(originY + (i + 0.5f) / scale - 0.5f, 0f, tilePixelSize - 1);
+                            var y0 = (int) sy;
+                            var y1 = Math.Min(y0 + 1, tilePixelSize - 1);
+                            var fy = sy - y0;
+                            var rowOffset = (int) tx * tileSize * bytesPerPixel + ((int) ty * tileSize + i) * rowBytes;
+                            for (var j = 0; j < tileSize; j++)
+                            {
+                                var sx = Math.Clamp(originX + (j + 0.5f) / scale - 0.5f, 0f, tilePixelSize - 1);
+                                var x0 = (int) sx;
+                                var x1 = Math.Min(x0 + 1, tilePixelSize - 1);
+                                var fx = sx - x0;
+                                var dst = rowOffset + j * bytesPerPixel;
+                                if (!bilinear)
+                                {
+                                    var src = ((int) MathF.Round(sy) * tilePixelSize + (int) MathF.Round(sx)) * bytesPerPixel;
+                                    data.AsSpan(Math.Min(src, data.Length - bytesPerPixel), bytesPerPixel).CopyTo(result[dst..]);
+                                    continue;
+                                }
+                                for (var c = 0; c < bytesPerPixel; c++)
+                                {
+                                    var top = data[(y0 * tilePixelSize + x0) * bytesPerPixel + c] * (1 - fx) + data[(y0 * tilePixelSize + x1) * bytesPerPixel + c] * fx;
+                                    var bottom = data[(y1 * tilePixelSize + x0) * bytesPerPixel + c] * (1 - fx) + data[(y1 * tilePixelSize + x1) * bytesPerPixel + c] * fx;
+                                    result[dst + c] = (byte) Math.Clamp(MathF.Round(top * (1 - fy) + bottom * fy), 0f, 255f);
+                                }
+                            }
+                        }
+
+                        found = true;
+                        filled++;
+                    }
+
+                    if (found || pixelDataPtr is null)
+                        continue;
+                    // no level has it: the fallback colour UE samples for missing pages (8-bit BGRA / RGBA; other formats stay zero)
+                    var fallback = layer < vt.LayerFallbackColors?.Length ? vt.LayerFallbackColors[layer].ToFColor(texture.SRGB) : new FColor(0, 0, 0, 255);
+                    byte[] pixel = colorType switch
+                    {
+                        EPixelFormat.PF_B8G8R8A8 => [fallback.B, fallback.G, fallback.R, fallback.A],
+                        EPixelFormat.PF_R8G8B8A8 => [fallback.R, fallback.G, fallback.B, fallback.A],
+                        _ => new byte[bytesPerPixel]
+                    };
+                    for (var i = 0; i < tileSize; i++)
+                    {
+                        var rowOffset = (int) tx * tileSize * bytesPerPixel + ((int) ty * tileSize + i) * rowBytes;
+                        for (var j = 0; j < tileSize; j++)
+                            pixel.AsSpan(0, Math.Min(pixel.Length, bytesPerPixel)).CopyTo(result[(rowOffset + j * bytesPerPixel)..]);
+                    }
+                }
+
+                if (missing.Count > 0)
+                    Log.Debug("{Name}: {Missing} tiles of level {Level} without data, {Filled} from coarser levels", texture.Name, missing.Count, level, filled);
 
                 // free crunch context
                 foreach (var context in crunchContextCache.Values)

@@ -207,6 +207,25 @@ public class FVirtualTextureBuiltData
         return bIsValid;
     }
 
+    /// <summary>
+    /// Whether a valid address holds tile data at this level. A UDIM block smaller than the largest one has no tiles in the finer levels
+    /// (it starts at a coarser mip), GetTileData then returns offset 0, which is another tile's data.
+    /// </summary>
+    public bool HasTileData(int vLevel, uint vAddress)
+    {
+        if (IsLegacyData())
+        {
+            var tileIndex = GetTileIndex_Legacy(vLevel, vAddress);
+            if (tileIndex == ~0u)
+                return false;
+            var chunkIndex = GetChunkIndex_Legacy(tileIndex);
+            return GetTileOffset_Legacy(chunkIndex, tileIndex) != GetTileOffset_Legacy(chunkIndex, tileIndex + NumLayers);
+        }
+
+        return BaseOffsetPerMip != null && BaseOffsetPerMip.Length > vLevel && TileOffsetData != null && TileOffsetData.Length > vLevel &&
+               BaseOffsetPerMip[vLevel] != ~0u && TileOffsetData[vLevel].GetTileOffset(vAddress) != ~0u;
+    }
+
     public (int, uint, uint) GetTileData(int vLevel, uint vAddress, uint layerIndex)
     {
         int chunkIndex = 0;

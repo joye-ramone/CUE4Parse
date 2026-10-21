@@ -34,6 +34,20 @@ public partial class MeshLodDto<TVertex>
             extraUvs[i] = new FMeshUVFloat[vertices.Length];
         }
 
+        // sections are not always in vertex order (S.T.A.L.K.E.R. 2 fallback LODs): take a vertex's bone map from the section whose range holds it
+        ushort[]?[]? vertexBoneMaps = null;
+        if (lod.Chunks.Length == 0 && !bUseVerticesFromSections)
+        {
+            vertexBoneMaps = new ushort[]?[vertexCount];
+            foreach (var s in lod.Sections)
+            {
+                for (var v = s.BaseVertexIndex; v < Math.Min(s.BaseVertexIndex + (uint) s.NumVertices, (uint) vertexCount); v++)
+                {
+                    vertexBoneMaps[v] = s.BoneMap;
+                }
+            }
+        }
+
         FColor[]? vertexColors = null;
         if (lod.ColorVertexBuffer is { Data.Length: > 0 })
         {
@@ -86,7 +100,7 @@ public partial class MeshLodDto<TVertex>
                 vertex = lod.VertexBufferGPUSkin.VertsFloat[i];
             }
 
-            vertices[i] = new SkinnedMeshVertex(vertex, boneMap);
+            vertices[i] = new SkinnedMeshVertex(vertex, vertexBoneMaps?[i] ?? boneMap);
 
             for (var j = 0; j < extraUvs.Length; j++)
             {

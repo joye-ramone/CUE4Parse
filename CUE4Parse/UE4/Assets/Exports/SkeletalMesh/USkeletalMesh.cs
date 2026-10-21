@@ -178,6 +178,15 @@ public partial class USkeletalMesh : USkinnedAsset
                     {
                         fallbackLODModels[i] = new FStaticLODModel();
                         fallbackLODModels[i].SerializeRenderItem(Ar, bHasVertexColors, NumVertexColorChannels);
+
+                        // the vertices of fallback LOD i index the bone maps of LOD i's sections; the fallback's own maps don't match them
+                        if (i < LODModels.Length && LODModels[i].Sections.Length >= fallbackLODModels[i].Sections.Length)
+                        {
+                            for (var s = 0; s < fallbackLODModels[i].Sections.Length; s++)
+                            {
+                                fallbackLODModels[i].Sections[s].BoneMap = LODModels[i].Sections[s].BoneMap;
+                            }
+                        }
                     }
 
                     LODModels = LODModels.Concat(fallbackLODModels).ToArray();
