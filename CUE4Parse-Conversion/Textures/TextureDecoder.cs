@@ -215,13 +215,16 @@ public static class TextureDecoder
                 // tiles without data here: the parent tile of the first coarser level that has one, upscaled (bilinear for 8-bit channels,
                 // the tile border gives the samples past the region's edge), as the VT sampler falls back at run time; none: the layer's
                 // fallback colour
+                // only as far as a parent tile stays inside one UDIM block: in coarser mips a tile spans several blocks, and an absent
+                // block would get its neighbours' pixels
+                var blockTiles = (int) Math.Min(vt.Width / Math.Max(vt.WidthInBlocks, 1u), vt.Height / Math.Max(vt.HeightInBlocks, 1u)) / tileSize >> level;
                 var filled = 0;
                 foreach (var address in failed ? new List<uint>() : missing)
                 {
                     var tx = MathUtils.ReverseMortonCode2(address);
                     var ty = MathUtils.ReverseMortonCode2(address >> 1);
                     var found = false;
-                    for (var coarse = level + 1; coarse < vt.NumMips && !found; coarse++)
+                    for (var coarse = level + 1; coarse < vt.NumMips && !found && (1 << (coarse - level)) <= Math.Max(blockTiles, 1); coarse++)
                     {
                         var shift = coarse - level;
                         var parent = MathUtils.MortonCode2(tx >> shift) | (MathUtils.MortonCode2(ty >> shift) << 1);

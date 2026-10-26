@@ -24,6 +24,8 @@ public sealed class MaterialExporter(UMaterialInterface material) : ExporterBase
         {
             ct.ThrowIfCancellationRequested();
             if (!ptr.TryLoad<UTexture>(out var texture)) continue;
+            // render targets (e.g. a game's global RainShadowMap) are filled at runtime: the package has no pixels to export
+            if (texture is UTextureRenderTarget) continue;
 
             Session.Add(texture);
         }
